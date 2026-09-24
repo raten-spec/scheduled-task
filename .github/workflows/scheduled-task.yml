@@ -1,0 +1,37 @@
+name: Scheduled Task
+
+on:
+  schedule:
+    # Zamanlanmış (cron) görevler dakikada bir garanti çalışmaz; sık
+    # tetiklenmesi hedeflenir ama yoğunlukta gecikebilir.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}   # Actions sekmesinden elle de tetiklenebilir
+
+jobs:
+  run-task:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4     # bir sonraki çalışmayla çakışmasın diye sınır
+
+    steps:
+      - name: Kodu al
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bağımlılıkları kur
+        run: pip install -r requirements.txt
+
+      - name: Görevi çalıştır
+        env:
+          ACCOUNT_NAME: ${{ secrets.ACCOUNT_NAME }}
+          ACCOUNT_KEY: ${{ secrets.ACCOUNT_KEY }}
+          DRY_RUN: ${{ vars.DRY_RUN || 'true' }}
+          BASE_SYMBOL: ${{ vars.BASE_SYMBOL || 'SWAP.LTC' }}
+          ORDER_SIZE_QUOTE: ${{ vars.ORDER_SIZE_QUOTE || '1' }}
+          MAX_ALLOCATION_PCT: ${{ vars.MAX_ALLOCATION_PCT || '20' }}
+          MIN_PROFIT_PCT: ${{ vars.MIN_PROFIT_PCT || '0.3' }}
+          STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT || '0' }}
+        run: python task.py
