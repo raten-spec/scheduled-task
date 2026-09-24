@@ -1,0 +1,3 @@
+nectarengine>=0.0.4
+nectar>=0.0.4
+requests
