@@ -7,6 +7,13 @@ on:
     - cron: "*/5 * * * *"
   workflow_dispatch: {}   # Actions sekmesinden elle de tetiklenebilir
 
+permissions:
+  contents: write   # ledger (state/positions.json) dosyasını commit'leyebilmek için
+
+concurrency:
+  group: scheduled-task-ledger
+  cancel-in-progress: false   # aynı anda iki run'ın ledger'ı ezmesini engeller
+
 jobs:
   run-task:
     runs-on: ubuntu-latest
@@ -15,6 +22,9 @@ jobs:
     steps:
       - name: Kodu al
         uses: actions/checkout@v4
+        with:
+          # en güncel ledger'ı garanti almak için
+          fetch-depth: 1
 
       - name: Python kur
         uses: actions/setup-python@v5
@@ -35,3 +45,18 @@ jobs:
           MIN_PROFIT_PCT: ${{ vars.MIN_PROFIT_PCT || '0.3' }}
           STOP_LOSS_PCT: ${{ vars.STOP_LOSS_PCT || '0' }}
         run: python task.py
+
+      - name: Ledger'ı commit'le
+        if: always()   # task.py hata ile bitse bile ledger güncellenmiş olabilir
+        run: |
+          if [ -n "$(git status --porcelain state/)" ]; then
+            git config user.name "scheduled-task-bot"
+            git config user.email "actions@users.noreply.github.com"
+            git add state/
+            git commit -m "ledger güncellendi [skip ci]"
+            # başka bir run arada push etmiş olabilir; rebase edip tekrar dene
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          else
+            echo "Ledger değişmedi, commit atılmadı."
+          fi
