@@ -665,17 +665,20 @@ def plan_sell(
         else:
 
             # Mevcut emir güvenli tabanın altındaysa
-            # KESİNLİKLE korunmaz.
+            # KESİNLİKLE korunmaz. Burada None DÖNMÜYORUZ:
+            # aşağıdaki "DEFTER REFERANSI" bölümü zaten floor'u
+            # taban alarak gerçek bir hedef fiyat hesaplayıp
+            # "place" ile döndürecek, run() da bu durumda eski
+            # emri iptal edip yenisini açacak.
             if our_top_ask < floor * (
                 1 - 1e-9
             ):
-                return (
-                    "place",
-                    None,
-                    "mevcut satış güvenli maliyet tabanının altında",
+                note = (
+                    "mevcut satış güvenli maliyet tabanının "
+                    "altındaydı, doğru fiyattan yeniden açılıyor"
                 )
 
-            if (
+            elif (
                 our_top_ask >= floor * (
                     1 - 1e-9
                 )
