@@ -1,0 +1,12 @@
+{
+  "lots": [
+    {
+      "qty": 0.0019759499999999998,
+      "price": 1216.99999997,
+      "ts": 1790366610.368411
+    }
+  ],
+  "total_owned": 0.00196591,
+  "pending_buy_price": null,
+  "pending_sell_price": 1229.16999997
+}
