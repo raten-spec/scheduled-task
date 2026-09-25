@@ -622,49 +622,100 @@ def fifo_lots_from_rows(rows, symbol):
 
 def fifo_cost_from_rows(rows, symbol):
     """
-    FIFO lotlarından kalan stok için maliyet bilgisi üretir.
+    Geçmiş trade kayıtlarından FIFO ile kalan lotları hesaplar.
 
-    Dönüş:
+    ÖNEMLİ: Bu fonksiyon yalnızca HISTORY'nin gösterdiği
+    envanteri hesaplar. Cüzdandaki gerçek bakiye ile eşleşip
+    eşleşmediğine burada karar verilmez. Bu kontrol run() içinde
+    ayrıca yapılır.
 
-        {
-            "qty": ...,
-            "total_cost": ...,
-            "avg_cost": ...,
-            "lots": [...]
-        }
-
-    Hiç stok yoksa None.
+    Böylece history'de 0.0439 token kalmış görünürken cüzdanda
+    0.000993 token varsa, bu iki sayı sessizce birbirine
+    dönüştürülmez ve sahte bir maliyet üretilmez.
     """
 
-    lots = fifo_lots_from_rows(
-        rows,
-        symbol,
-    )
+    lots = fifo_lots_from_rows(rows, symbol)
 
     if not lots:
         return None
 
-    total_qty = sum(
-        lot["qty"]
-        for lot in lots
-    )
-
-    total_cost = sum(
-        lot["total_cost"]
-        for lot in lots
-    )
+    total_qty = sum(lot["qty"] for lot in lots)
+    total_cost = sum(lot["total_cost"] for lot in lots)
 
     if total_qty <= 1e-12:
         return None
 
-    avg_cost = total_cost / total_qty
-
     return {
         "qty": total_qty,
         "total_cost": total_cost,
-        "avg_cost": avg_cost,
+        "avg_cost": total_cost / total_qty,
         "lots": lots,
     }
+
+
+def order_quantity(order):
+    """Açık emirdeki token miktarını mümkün formatlardan okur."""
+    for key in ("quantity", "amount", "tokens"):
+        value = safe_float(order.get(key))
+        if value is not None and value > 0:
+            return value
+    return 0.0
+
+
+def open_sell_quantity(orders):
+    """Açık satış emirlerinde kilitli olabilecek token miktarını toplar."""
+    return sum(order_quantity(o) for o in orders)
+
+
+def reconcile_fifo_with_wallet(cost_info, wallet_qty, locked_sell_qty=0.0, tolerance=1e-8):
+    """
+    History FIFO envanterini gerçek cüzdan envanteriyle doğrular.
+
+    Normal durumda:
+        FIFO kalan = kullanılabilir bakiye + açık satışlarda kilitli miktar
+
+    Eşleşmiyorsa maliyet bilinmiyor kabul edilir. Eksik/fazla kısmın
+    hangi lota ait olduğu tahmin edilmez. Bu, yanlış ortalama maliyet
+    üretmekten daha güvenlidir.
+    """
+    if cost_info is None:
+        return None, "history'de maliyetlendirilebilir lot yok"
+
+    actual_qty = max(0.0, wallet_qty) + max(0.0, locked_sell_qty)
+    history_qty = max(0.0, cost_info["qty"])
+    difference = history_qty - actual_qty
+
+    if abs(difference) > tolerance:
+        return None, (
+            "envanter uyuşmazlığı: "
+            f"history={history_qty:.12f}, "
+            f"cüzdan+kilitli_satış={actual_qty:.12f}, "
+            f"fark={difference:.12f}"
+        )
+
+    # Küçük floating-point farklarını gerçek bakiye ile orantılı
+    # şekilde ölçeklendiriyoruz. Maliyet oranı aynı kaldığı için
+    # mevcut gerçek miktarın toplam maliyeti buna göre küçültülür.
+    scale = (
+        actual_qty / history_qty
+        if history_qty > 1e-12
+        else 0.0
+    )
+
+    matched_qty = actual_qty
+    matched_cost = cost_info["total_cost"] * scale
+    matched_avg = (
+        matched_cost / matched_qty
+        if matched_qty > 1e-12
+        else None
+    )
+
+    return {
+        "qty": matched_qty,
+        "total_cost": matched_cost,
+        "avg_cost": matched_avg,
+        "lots": cost_info["lots"],
+    }, None
 
 
 # ============================================================================
@@ -1656,10 +1707,41 @@ def run():
                 BASE_SYMBOL,
             )
 
-            cost_info = fifo_cost_from_rows(
+            raw_cost_info = fifo_cost_from_rows(
                 rows,
                 BASE_SYMBOL,
             )
+
+            locked_sell_qty = open_sell_quantity(
+                open_sells
+            )
+
+            cost_info, reconcile_error = reconcile_fifo_with_wallet(
+                raw_cost_info,
+                sellable,
+                locked_sell_qty=locked_sell_qty,
+            )
+
+            if raw_cost_info is not None:
+                log.info(
+                    "%s envanter mutabakatı: history FIFO=%.12f | "
+                    "cüzdan=%.12f | açık satış kilidi=%.12f",
+                    BASE_SYMBOL,
+                    raw_cost_info["qty"],
+                    sellable,
+                    locked_sell_qty,
+                )
+
+            if reconcile_error:
+                log.error(
+                    "GÜVENLİK: %s %s",
+                    BASE_SYMBOL,
+                    reconcile_error,
+                )
+                log.error(
+                    "History ile gerçek bakiye eşleşmediği için "
+                    "maliyet güvenilir değil. SATIŞ YAPILMAYACAK."
+                )
 
         except Exception as e:
 
@@ -1693,13 +1775,22 @@ def run():
             total_cost = cost_info["total_cost"]
             cost = cost_info["avg_cost"]
 
-            safe_floor = calculate_safe_sell_price(
-                cost
-            )
+            if cost is None or cost <= 0:
+                log.error(
+                    "GÜVENLİK: %s için geçerli maliyet bulunamadı. "
+                    "SATIŞ YAPILMAYACAK.",
+                    BASE_SYMBOL,
+                )
+                action = "wait"
+                price = None
+                note = "geçerli maliyet yok"
+                safe_floor = None
+            else:
+                safe_floor = calculate_safe_sell_price(cost)
 
             log.info(
-                "%s FIFO maliyeti: "
-                "kalan geçmiş stok=%.12f "
+                "%s FIFO maliyeti (doğrulanmış mevcut envanter): "
+                "kalan stok=%.12f "
                 "toplam maliyet=%.8f "
                 "ortalama gerçek maliyet=%.8f",
                 BASE_SYMBOL,
