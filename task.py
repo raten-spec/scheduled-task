@@ -4,7 +4,21 @@ Otomatik emir yöneticisi.
 
 MALİYET SİSTEMİ
 ---------------
-Bu sürüm hareketli ortalama yerine FIFO lot maliyeti kullanır.
+Maliyet, blockchain history'sinden yeniden inşa edilmiyor. Bunun yerine
+bot kendi yerel "ledger"ını (STATE_FILE, varsayılan state/positions.json)
+tutar ve bunu her çalıştırma sonunda repoya commit'ler
+(.github/workflows/scheduled-task.yml içindeki commit adımına bakın).
+
+Her run() başında şu karşılaştırma yapılır:
+
+    toplam_sahip_olunan = cüzdan + açık satışta kilitli miktar
+
+Bu, bir önceki çalıştırmada kaydedilen değerden:
+
+  - ARTMIŞSA  -> önceki turdaki açık alış emrimiz dolmuş demektir;
+                 o fiyattan yeni bir lot ledger'a eklenir.
+  - AZALMIŞSA -> önceki turdaki açık satış emrimiz dolmuş demektir;
+                 ledger'dan FIFO ile o kadar miktar düşülür.
 
 Her alış ayrı bir lot olarak tutulur:
 
@@ -12,12 +26,7 @@ Her alış ayrı bir lot olarak tutulur:
     0.500 LTC @ 1200
     0.200 LTC @ 1500
 
-Satışlarda önce en eski lot tüketilir.
-
-Maliyet hesabında:
-    alış fiyatı
-    + BUY_FEE_PCT
-    = gerçek alış maliyeti
+Satışlarda önce en eski lot tüketilir (FIFO).
 
 Satış tabanı:
 
@@ -30,7 +39,7 @@ Böylece satış işlem ücretinden sonra da minimum kâr korunur.
 
 GÜVENLİK
 --------
-Maliyet hesaplanamazsa SATIŞ YAPILMAZ.
+Ledger'da geçerli/yeterli maliyet yoksa SATIŞ YAPILMAZ.
 
 STOP_LOSS_PCT = 0 ise zararına satış kesinlikle yapılmaz.
 
@@ -50,8 +59,8 @@ ENV:
     TOP_TICKS=1
 
     MIN_PROFIT_PCT=1
-    BUY_FEE_PCT=0.75
-    SELL_FEE_PCT=0.75
+    BUY_FEE_PCT=0
+    SELL_FEE_PCT=0
 
     STOP_LOSS_PCT=0
 
@@ -60,11 +69,11 @@ ENV:
 
     SEND_DELAY_SECS=6
 
-    HISTORY_URL=https://history.hive-engine.com/accountHistory
-    HISTORY_PAGE_SIZE=500
+    STATE_FILE=state/positions.json
 
 ÖNEMLİ:
 DRY_RUN=false yapmadan önce mutlaka DRY_RUN=true ile test edin.
+DRY_RUN=true iken ledger dosyası diske yazılmaz (test amaçlı).
 """
 
 import os
@@ -128,34 +137,30 @@ MIN_PROFIT_PCT = float(
 # YENİ MALİYET AYARLARI
 # ---------------------------------------------------------------------------
 
-# Hive Engine işlemlerinde kullanılacak maliyet oranları.
-#
-# Varsayılan %0.75.
-# Gerekirse GitHub Actions Secrets/Variables üzerinden değiştirilebilir.
+# Hive Engine market'inde alım/satım komisyonu yok, o yüzden
+# varsayılan %0. Yine de borsa ileride komisyon eklerse ya da
+# BUNDLE_MODE gibi Hive işlem ücretlerini de dahil etmek istersen
+# GitHub Actions Secrets/Variables üzerinden değiştirebilirsin.
 #
 # Örnek:
-# BUY_FEE_PCT=0.75
-# SELL_FEE_PCT=0.75
+# BUY_FEE_PCT=0.5
+# SELL_FEE_PCT=0.5
 
 BUY_FEE_PCT = float(
-    os.environ.get("BUY_FEE_PCT", "0.75")
+    os.environ.get("BUY_FEE_PCT", "0")
 )
 
 SELL_FEE_PCT = float(
-    os.environ.get("SELL_FEE_PCT", "0.75")
+    os.environ.get("SELL_FEE_PCT", "0")
 )
 
 STOP_LOSS_PCT = float(
     os.environ.get("STOP_LOSS_PCT", "0")
 )
 
-HISTORY_URL = os.environ.get(
-    "HISTORY_URL",
-    "https://history.hive-engine.com/accountHistory"
-)
-
-HISTORY_PAGE_SIZE = int(
-    os.environ.get("HISTORY_PAGE_SIZE", "500")
+STATE_FILE = os.environ.get(
+    "STATE_FILE",
+    "state/positions.json"
 )
 
 BOOK_SAMPLE_LIMIT = int(
@@ -363,294 +368,128 @@ def get_precision(api, symbol):
 
 
 # ============================================================================
-# HISTORY
+# YEREL POZİSYON DEFTERİ (LEDGER)
 # ============================================================================
+#
+# GitHub Actions runner'ları her çalıştırmada sıfırdan başladığı (state'siz
+# olduğu) için, "hangi fiyattan aldık" bilgisini blockchain history'sinden
+# her seferinde yeniden inşa etmek yerine, botun kendi ürettiği bir JSON
+# dosyasında (STATE_FILE) saklıyoruz. Bu dosya workflow tarafından her
+# çalıştırma sonunda repoya commit'lenir (bkz. scheduled-task.yml).
+#
+# lots: [{"qty": ..., "price": ..., "ts": ...}, ...]  (en eski lot önde,
+# FIFO tüketilir)
 
-def fetch_history(
-    account,
-    symbol,
-    limit=None,
-    max_pages=None,
-):
-    """
-    Hesap geçmişini sayfa sayfa okur.
+def load_state():
 
-    Eski sürümde sabit 8 sayfa vardı:
-        8 x 500 = 4000 kayıt.
+    default = {
+        "lots": [],
+        "total_owned": None,
+        "pending_buy_price": None,
+        "pending_sell_price": None,
+    }
 
-    Bu sürüm stok geçmişini kesmemek için varsayılan olarak
-    son sayfaya kadar devam eder.
-
-    max_pages verilirse güvenlik amacıyla sınır koyulabilir.
-    """
-
-    import requests
-
-    if limit is None:
-        limit = HISTORY_PAGE_SIZE
-
-    rows = []
-
-    offset = 0
-    page = 0
-
-    while True:
-
-        if max_pages is not None and page >= max_pages:
-            log.warning(
-                "History max_pages sınırına ulaşıldı: %s",
-                max_pages,
-            )
-            break
-
-        r = requests.get(
-            HISTORY_URL,
-            params={
-                "account": account,
-                "symbol": symbol,
-                "limit": limit,
-                "offset": offset,
-            },
-            timeout=30,
-        )
-
-        r.raise_for_status()
-
-        chunk = r.json()
-
-        if not chunk:
-            break
-
-        if not isinstance(chunk, list):
-            raise ValueError(
-                "History API beklenmeyen format döndürdü."
-            )
-
-        rows.extend(chunk)
-
-        log.debug(
-            "History sayfa=%d offset=%d kayıt=%d toplam=%d",
-            page,
-            offset,
-            len(chunk),
-            len(rows),
-        )
-
-        if len(chunk) < limit:
-            break
-
-        offset += limit
-        page += 1
-
-    log.info(
-        "%s geçmişinden %d işlem kaydı okundu.",
-        symbol,
-        len(rows),
-    )
-
-    return rows
-
-
-# ============================================================================
-# FIFO MALİYET SİSTEMİ
-# ============================================================================
-
-def get_timestamp(row):
-    """
-    History timestamp formatı farklı gelebileceği için
-    mümkün olduğunca güvenli sıralama anahtarı üretir.
-    """
-
-    value = row.get("timestamp", 0)
+    if not os.path.exists(STATE_FILE):
+        return default
 
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    except Exception as e:
+
+        log.warning(
+            "Durum dosyası (%s) okunamadı, sıfırdan başlanıyor: %r",
+            STATE_FILE,
+            e,
+        )
+
+        return default
+
+    if not isinstance(data, dict):
+        return default
+
+    for key, value in default.items():
+        data.setdefault(key, value)
+
+    return data
 
 
-def extract_trade_values(row):
+def save_state(state):
 
-    q = safe_float(
-        row.get("quantityTokens")
+    try:
+
+        directory = os.path.dirname(STATE_FILE)
+
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+
+        log.warning(
+            "Durum dosyası (%s) yazılamadı: %r",
+            STATE_FILE,
+            e,
+        )
+
+
+def ledger_totals(lots):
+    """Ledger'daki lotlardan toplam miktar/maliyet/ortalama maliyeti döner."""
+
+    total_qty = sum(lot["qty"] for lot in lots)
+    total_cost = sum(
+        lot["qty"] * lot["price"]
+        for lot in lots
     )
 
-    h = safe_float(
-        row.get("quantityHive")
+    avg_cost = (
+        total_cost / total_qty
+        if total_qty > 1e-12
+        else None
     )
 
-    if q is None or h is None:
-        return None, None
-
-    if q <= 0 or h <= 0:
-        return None, None
-
-    return q, h
+    return total_qty, total_cost, avg_cost
 
 
-def fifo_lots_from_rows(rows, symbol):
+def consume_lots_fifo(lots, qty):
     """
-    Geçmiş market_buy / market_sell kayıtlarından
-    elde kalan lotları FIFO ile hesaplar.
+    Ledger'dan FIFO sırasıyla qty kadar düşer.
 
-    Her lot:
+    Döndürür: (kalan_lotlar, düşülen_maliyet, karşılığı_bulunamayan_miktar)
 
-        {
-            "qty": kalan token,
-            "unit_cost": gerçek alış maliyeti,
-            "total_cost": kalan toplam maliyet
-        }
-
-    Alış:
-        unit_cost = (ödenen HIVE / alınan token)
-                    * (1 + BUY_FEE_PCT / 100)
-
-    Satış:
-        en eski lotlardan düşülür.
-
-    Böylece hareketli ortalama kullanılmaz.
+    Karşılığı bulunamayan miktar > 0 ise, ledger'da o kadar token için
+    kayıtlı bir alış yoktu demektir (örn. harici bir transfer/çekim).
     """
 
-    lots = []
+    remaining = qty
+    new_lots = []
+    consumed_cost = 0.0
 
-    relevant = []
+    for lot in lots:
 
-    for row in rows:
-
-        if row.get("symbol") != symbol:
+        if remaining <= 1e-12:
+            new_lots.append(lot)
             continue
 
-        operation = row.get("operation")
+        take = min(remaining, lot["qty"])
+        consumed_cost += take * lot["price"]
+        remaining -= take
 
-        if operation not in (
-            "market_buy",
-            "market_sell",
-        ):
-            continue
+        left = lot["qty"] - take
 
-        relevant.append(row)
-
-    relevant.sort(key=get_timestamp)
-
-    for row in relevant:
-
-        operation = row.get("operation")
-
-        q, h = extract_trade_values(row)
-
-        if q is None or h is None:
-            continue
-
-        # ------------------------------------------------------------------
-        # ALIŞ
-        # ------------------------------------------------------------------
-
-        if operation == "market_buy":
-
-            gross_unit_cost = h / q
-
-            # Alış maliyetine işlem ücretini ekle.
-            unit_cost = (
-                gross_unit_cost
-                * (1 + BUY_FEE_PCT / 100.0)
-            )
-
-            lots.append(
+        if left > 1e-12:
+            new_lots.append(
                 {
-                    "qty": q,
-                    "unit_cost": unit_cost,
-                    "total_cost": q * unit_cost,
-                    "timestamp": get_timestamp(row),
+                    "qty": left,
+                    "price": lot["price"],
+                    "ts": lot.get("ts"),
                 }
             )
 
-        # ------------------------------------------------------------------
-        # SATIŞ
-        # ------------------------------------------------------------------
-
-        elif operation == "market_sell":
-
-            remaining_to_sell = q
-
-            while (
-                remaining_to_sell > 1e-12
-                and lots
-            ):
-
-                lot = lots[0]
-
-                consumed = min(
-                    remaining_to_sell,
-                    lot["qty"],
-                )
-
-                lot["qty"] -= consumed
-
-                lot["total_cost"] = (
-                    lot["qty"]
-                    * lot["unit_cost"]
-                )
-
-                remaining_to_sell -= consumed
-
-                if lot["qty"] <= 1e-12:
-                    lots.pop(0)
-
-            # History'de satış, kayıtlı alışlardan fazla ise:
-            #
-            # Bu durum:
-            #   - history eksikliği
-            #   - transfer
-            #   - deposit
-            #   - başka bir kaynak
-            #
-            # anlamına gelebilir.
-            #
-            # Eksik maliyetli kısmı uydurmuyoruz.
-            if remaining_to_sell > 1e-10:
-
-                log.warning(
-                    "FIFO uyarısı: %.12f %s satışının "
-                    "karşılığı geçmiş alışlarda bulunamadı. "
-                    "History eksik olabilir.",
-                    remaining_to_sell,
-                    symbol,
-                )
-
-    return lots
-
-
-def fifo_cost_from_rows(rows, symbol):
-    """
-    Geçmiş trade kayıtlarından FIFO ile kalan lotları hesaplar.
-
-    ÖNEMLİ: Bu fonksiyon yalnızca HISTORY'nin gösterdiği
-    envanteri hesaplar. Cüzdandaki gerçek bakiye ile eşleşip
-    eşleşmediğine burada karar verilmez. Bu kontrol run() içinde
-    ayrıca yapılır.
-
-    Böylece history'de 0.0439 token kalmış görünürken cüzdanda
-    0.000993 token varsa, bu iki sayı sessizce birbirine
-    dönüştürülmez ve sahte bir maliyet üretilmez.
-    """
-
-    lots = fifo_lots_from_rows(rows, symbol)
-
-    if not lots:
-        return None
-
-    total_qty = sum(lot["qty"] for lot in lots)
-    total_cost = sum(lot["total_cost"] for lot in lots)
-
-    if total_qty <= 1e-12:
-        return None
-
-    return {
-        "qty": total_qty,
-        "total_cost": total_cost,
-        "avg_cost": total_cost / total_qty,
-        "lots": lots,
-    }
+    return new_lots, consumed_cost, remaining
 
 
 def order_quantity(order):
@@ -665,57 +504,6 @@ def order_quantity(order):
 def open_sell_quantity(orders):
     """Açık satış emirlerinde kilitli olabilecek token miktarını toplar."""
     return sum(order_quantity(o) for o in orders)
-
-
-def reconcile_fifo_with_wallet(cost_info, wallet_qty, locked_sell_qty=0.0, tolerance=1e-8):
-    """
-    History FIFO envanterini gerçek cüzdan envanteriyle doğrular.
-
-    Normal durumda:
-        FIFO kalan = kullanılabilir bakiye + açık satışlarda kilitli miktar
-
-    Eşleşmiyorsa maliyet bilinmiyor kabul edilir. Eksik/fazla kısmın
-    hangi lota ait olduğu tahmin edilmez. Bu, yanlış ortalama maliyet
-    üretmekten daha güvenlidir.
-    """
-    if cost_info is None:
-        return None, "history'de maliyetlendirilebilir lot yok"
-
-    actual_qty = max(0.0, wallet_qty) + max(0.0, locked_sell_qty)
-    history_qty = max(0.0, cost_info["qty"])
-    difference = history_qty - actual_qty
-
-    if abs(difference) > tolerance:
-        return None, (
-            "envanter uyuşmazlığı: "
-            f"history={history_qty:.12f}, "
-            f"cüzdan+kilitli_satış={actual_qty:.12f}, "
-            f"fark={difference:.12f}"
-        )
-
-    # Küçük floating-point farklarını gerçek bakiye ile orantılı
-    # şekilde ölçeklendiriyoruz. Maliyet oranı aynı kaldığı için
-    # mevcut gerçek miktarın toplam maliyeti buna göre küçültülür.
-    scale = (
-        actual_qty / history_qty
-        if history_qty > 1e-12
-        else 0.0
-    )
-
-    matched_qty = actual_qty
-    matched_cost = cost_info["total_cost"] * scale
-    matched_avg = (
-        matched_cost / matched_qty
-        if matched_qty > 1e-12
-        else None
-    )
-
-    return {
-        "qty": matched_qty,
-        "total_cost": matched_cost,
-        "avg_cost": matched_avg,
-        "lots": cost_info["lots"],
-    }, None
 
 
 # ============================================================================
@@ -1677,6 +1465,193 @@ def run():
     )
 
     # ========================================================================
+    # LEDGER: DOLAN EMİRLERİ TESPİT ET
+    # ========================================================================
+    #
+    # Bu bot GitHub Actions üzerinde her seferinde sıfırdan başlar, o yüzden
+    # "hangi fiyattan alındığını" bilmenin tek yolu, kendi kaydettiğimiz
+    # pozisyon defterini (ledger) çalışmalar arasında bir dosyada taşımaktır
+    # (bkz. .github/workflows/scheduled-task.yml içindeki commit adımı).
+    #
+    # Mantık:
+    #   toplam_sahip_olunan = cüzdan + açık satışta kilitli miktar
+    #
+    # Bu sayı önceki çalıştırmaya göre ARTMIŞSA: önceki turda açık olan
+    # alış emrimiz dolmuş demektir -> o fiyattan yeni bir lot ekleniyor.
+    #
+    # AZALMIŞSA: önceki turda açık olan satış emrimiz dolmuş demektir ->
+    # ledger'dan FIFO ile o kadar miktar düşülüyor.
+
+    state = load_state()
+    lots = state.get("lots", [])
+
+    locked_sell_qty_now = open_sell_quantity(open_sells)
+    total_owned_now = base_balance + locked_sell_qty_now
+
+    prev_total_owned = state.get("total_owned")
+
+    if prev_total_owned is None:
+
+        # İlk çalıştırma / durum dosyası yok ya da total_owned
+        # kasıtlı olarak boş bırakılmış (elle lot girildiğinde
+        # olduğu gibi). Elle girilmiş lotlar varsa onlara
+        # dokunmuyoruz; sadece hiç lot yoksa bootstrap ediyoruz.
+        if lots:
+
+            log.info(
+                "%s için elle girilmiş ledger lotları kullanılıyor "
+                "(bu turda fark tespiti atlandı).",
+                BASE_SYMBOL,
+            )
+
+        elif total_owned_now > DUST_THRESHOLD:
+
+            bootstrap_price = (
+                best_ask
+                if best_ask is not None
+                else best_bid
+            )
+
+            if bootstrap_price:
+
+                lots = [
+                    {
+                        "qty": total_owned_now,
+                        "price": bootstrap_price,
+                        "ts": time.time(),
+                    }
+                ]
+
+                log.warning(
+                    "Durum dosyası (%s) bulunamadı; mevcut %.12f %s "
+                    "gerçek maliyeti bilinmediği için güncel fiyattan "
+                    "(%.8f) 'bootstrap' maliyeti olarak kaydedildi. "
+                    "Gerçek alış maliyetini biliyorsan bu dosyayı "
+                    "elle düzenleyebilirsin.",
+                    STATE_FILE,
+                    total_owned_now,
+                    BASE_SYMBOL,
+                    bootstrap_price,
+                )
+
+            else:
+
+                lots = []
+
+                log.warning(
+                    "Durum dosyası yok ve defterde referans fiyat "
+                    "bulunamadığı için ledger boş başlatıldı."
+                )
+
+    else:
+
+        delta = total_owned_now - prev_total_owned
+
+        if delta > DUST_THRESHOLD:
+
+            buy_price = state.get("pending_buy_price")
+
+            if buy_price is None:
+
+                buy_price = (
+                    best_ask
+                    if best_ask is not None
+                    else best_bid
+                )
+
+                log.warning(
+                    "%.12f %s bakiyeye eklenmiş ama beklenen bir "
+                    "alış emri kaydı yoktu (muhtemelen harici bir "
+                    "yatırma/transfer). Maliyet güncel fiyattan "
+                    "(%s) varsayıldı.",
+                    delta,
+                    BASE_SYMBOL,
+                    buy_price,
+                )
+
+            else:
+
+                log.info(
+                    "Alış emri dolmuş görünüyor: "
+                    "+%.12f %s @ %.8f ledger'a ekleniyor.",
+                    delta,
+                    BASE_SYMBOL,
+                    buy_price,
+                )
+
+            if buy_price:
+
+                lots = lots + [
+                    {
+                        "qty": delta,
+                        "price": buy_price,
+                        "ts": time.time(),
+                    }
+                ]
+
+        elif delta < -DUST_THRESHOLD:
+
+            sold_qty = -delta
+
+            lots, consumed_cost, leftover = consume_lots_fifo(
+                lots,
+                sold_qty,
+            )
+
+            if leftover > 1e-9:
+
+                log.warning(
+                    "%.12f %s ledger'da karşılığı bulunamadan "
+                    "azalmış (muhtemelen harici transfer/çekim). "
+                    "Ledger'daki ilgili miktar sıfıra kadar düşürüldü.",
+                    leftover,
+                    BASE_SYMBOL,
+                )
+
+            else:
+
+                avg_sold_cost = (
+                    consumed_cost / sold_qty
+                    if sold_qty > 1e-12
+                    else None
+                )
+
+                sell_px = state.get("pending_sell_price")
+
+                if sell_px and avg_sold_cost is not None:
+
+                    realized = (
+                        sell_px * (1 - SELL_FEE_PCT / 100.0)
+                        - avg_sold_cost
+                    ) * sold_qty
+
+                    log.info(
+                        "Satış emri dolmuş görünüyor: "
+                        "-%.12f %s @ ~%.8f, ort. maliyet=%.8f, "
+                        "gerçekleşen kâr ≈ %.8f %s",
+                        sold_qty,
+                        BASE_SYMBOL,
+                        sell_px,
+                        avg_sold_cost,
+                        realized,
+                        QUOTE_SYMBOL,
+                    )
+
+                else:
+
+                    log.info(
+                        "%.12f %s ledger'dan düşüldü "
+                        "(ort. maliyet=%s).",
+                        sold_qty,
+                        BASE_SYMBOL,
+                        (
+                            "%.8f" % avg_sold_cost
+                            if avg_sold_cost is not None
+                            else "?"
+                        ),
+                    )
+
+    # ========================================================================
     # SATIŞ
     # ========================================================================
 
@@ -1695,107 +1670,43 @@ def run():
             )
 
         # --------------------------------------------------------------------
-        # FIFO MALİYETİNİ HESAPLA
+        # LEDGER MALİYETİNİ HESAPLA
         # --------------------------------------------------------------------
+        #
+        # Maliyet artık blockchain history'sinden yeniden inşa edilmiyor.
+        # Bunun yerine botun kendi tuttuğu yerel pozisyon defteri (ledger)
+        # kullanılıyor: her gerçekleşen alış/satış run() başında
+        # tespit edilip ledger_qty/ledger_cost güncelleniyor (aşağıda
+        # "LEDGER: DOLAN EMİRLERİ TESPİT ET" bölümüne bakın).
 
-        cost_info = None
+        ledger_qty, ledger_total_cost, cost = ledger_totals(lots)
 
-        try:
-
-            rows = fetch_history(
-                ACCOUNT_NAME,
-                BASE_SYMBOL,
-            )
-
-            raw_cost_info = fifo_cost_from_rows(
-                rows,
-                BASE_SYMBOL,
-            )
-
-            locked_sell_qty = open_sell_quantity(
-                open_sells
-            )
-
-            cost_info, reconcile_error = reconcile_fifo_with_wallet(
-                raw_cost_info,
-                sellable,
-                locked_sell_qty=locked_sell_qty,
-            )
-
-            if raw_cost_info is not None:
-                log.info(
-                    "%s envanter mutabakatı: history FIFO=%.12f | "
-                    "cüzdan=%.12f | açık satış kilidi=%.12f",
-                    BASE_SYMBOL,
-                    raw_cost_info["qty"],
-                    sellable,
-                    locked_sell_qty,
-                )
-
-            if reconcile_error:
-                log.error(
-                    "GÜVENLİK: %s %s",
-                    BASE_SYMBOL,
-                    reconcile_error,
-                )
-                log.error(
-                    "History ile gerçek bakiye eşleşmediği için "
-                    "maliyet güvenilir değil. SATIŞ YAPILMAYACAK."
-                )
-
-        except Exception as e:
+        if cost is None or cost <= 0 or ledger_qty <= DUST_THRESHOLD:
 
             log.error(
-                "Geçmiş okunamadı, "
-                "maliyet bilinmiyor; "
-                "bu tur SATIŞ YAPILMAYACAK: %r",
-                e,
-            )
-
-            cost_info = None
-
-        # --------------------------------------------------------------------
-        # MALİYET BULUNAMADI
-        # --------------------------------------------------------------------
-
-        if cost_info is None:
-
-            log.error(
-                "GÜVENLİK: %s için FIFO maliyeti "
-                "hesaplanamadı. SATIŞ EMRİ GÖNDERİLMİYOR.",
+                "GÜVENLİK: %s için ledger'da geçerli maliyet yok "
+                "(kalan=%.12f). SATIŞ EMRİ GÖNDERİLMİYOR.",
                 BASE_SYMBOL,
+                ledger_qty,
             )
 
             action = "wait"
             price = None
+            note = "ledger'da geçerli maliyet yok"
+            safe_floor = None
 
         else:
 
-            fifo_qty = cost_info["qty"]
-            total_cost = cost_info["total_cost"]
-            cost = cost_info["avg_cost"]
-
-            if cost is None or cost <= 0:
-                log.error(
-                    "GÜVENLİK: %s için geçerli maliyet bulunamadı. "
-                    "SATIŞ YAPILMAYACAK.",
-                    BASE_SYMBOL,
-                )
-                action = "wait"
-                price = None
-                note = "geçerli maliyet yok"
-                safe_floor = None
-            else:
-                safe_floor = calculate_safe_sell_price(cost)
+            safe_floor = calculate_safe_sell_price(cost)
 
             log.info(
-                "%s FIFO maliyeti (doğrulanmış mevcut envanter): "
+                "%s ledger maliyeti: "
                 "kalan stok=%.12f "
                 "toplam maliyet=%.8f "
                 "ortalama gerçek maliyet=%.8f",
                 BASE_SYMBOL,
-                fifo_qty,
-                total_cost,
+                ledger_qty,
+                ledger_total_cost,
                 cost,
             )
 
@@ -2202,6 +2113,69 @@ def run():
         )
 
         failed = True
+
+    # ========================================================================
+    # LEDGER KAYDI
+    # ========================================================================
+    #
+    # Son durumu (varsa gerçekleşen emirler dahil) tekrar okuyup
+    # kaydediyoruz. Bu şekilde bir sonraki çalıştırma, bu turda ne
+    # olduğundan bağımsız olarak her zaman gerçek zincir durumuna göre
+    # kıyaslama yapar (kendi kendini düzeltir).
+
+    final_open_buys = get_our_open_buy(market, BASE_SYMBOL)
+    final_open_sells = get_our_open_sell(market, BASE_SYMBOL)
+    final_base_balance = get_balance(wallet, BASE_SYMBOL)
+    final_locked_sell_qty = open_sell_quantity(final_open_sells)
+
+    state["lots"] = lots
+    state["total_owned"] = final_base_balance + final_locked_sell_qty
+
+    state["pending_buy_price"] = (
+        max(
+            (
+                safe_float(o.get("price"))
+                for o in final_open_buys
+                if safe_float(o.get("price")) is not None
+            ),
+            default=None,
+        )
+        if final_open_buys
+        else None
+    )
+
+    state["pending_sell_price"] = (
+        min(
+            (
+                safe_float(o.get("price"))
+                for o in final_open_sells
+                if safe_float(o.get("price")) is not None
+            ),
+            default=None,
+        )
+        if final_open_sells
+        else None
+    )
+
+    if not DRY_RUN:
+        save_state(state)
+    else:
+        log.info(
+            "[DRY_RUN] Durum dosyası diske yazılmadı "
+            "(test modunda ledger kalıcı değiştirilmez)."
+        )
+
+    remaining_qty, remaining_cost, remaining_avg = ledger_totals(lots)
+
+    log.info(
+        "Ledger: kalan=%.12f %s | ortalama maliyet=%s | "
+        "bekleyen alış fiyatı=%s | bekleyen satış fiyatı=%s",
+        remaining_qty,
+        BASE_SYMBOL,
+        ("%.8f" % remaining_avg) if remaining_avg is not None else "yok",
+        state["pending_buy_price"],
+        state["pending_sell_price"],
+    )
 
     log.info("Tamamlandı.")
 
