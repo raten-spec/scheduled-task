@@ -9,9 +9,14 @@
       "qty": 1.0039999999999789e-05,
       "price": 1216.99999999,
       "ts": 1790366950.6473773
+    },
+    {
+      "qty": 0.0009792999999999998,
+      "price": 1231.83758554,
+      "ts": 1790381839.4517221
     }
   ],
-  "total_owned": 0.000993,
-  "pending_buy_price": 1231.83758554,
-  "pending_sell_price": 1239.99999963
+  "total_owned": 0.00195861,
+  "pending_buy_price": null,
+  "pending_sell_price": 1244.00373123
 }
